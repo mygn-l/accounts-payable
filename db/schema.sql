@@ -332,8 +332,8 @@ CREATE TABLE statement_lines (
   -- money out, in CAD
   amount          numeric(14,2) NOT NULL,
   -- what it is, read from the line: an EFT payment (reference: the last 6 digits of the payment's), a cleared cheque (its number),
-  -- a virtual card charge (the card), or anything else, such as a bank fee
-  kind            text NOT NULL CHECK (kind IN ('eft','cheque','card','other')),
+  -- a virtual card charge (the card), a payment the bank sent back (its method and reference), or anything else, such as a bank fee
+  kind            text NOT NULL CHECK (kind IN ('eft','cheque','card','return','other')),
   reference       text,
   payment_id      text REFERENCES payments,
   imported_at     timestamptz NOT NULL DEFAULT now()

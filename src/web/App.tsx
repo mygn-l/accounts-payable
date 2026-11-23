@@ -7,6 +7,7 @@ import { del, get, useLoad } from "./api";
 import { org, useSession, useUser } from "./session";
 import { NavTabs, SubTabs } from "./components/NavTabs";
 import { NotFound, PageTitle } from "./components/ui";
+import { Assistant } from "./components/Assistant";
 import { Home } from "./pages/Home";
 import { EmployeeLogin, Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
@@ -153,6 +154,7 @@ function WorkspaceLayout() {
         <Outlet />
       </main>
       <SignedInFooter />
+      <Assistant />
     </div>
   );
 }

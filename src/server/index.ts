@@ -7,7 +7,10 @@ const ROOT = path.resolve(import.meta.dirname, "../..");
 const envFile = path.join(ROOT, ".env.local");
 if (existsSync(envFile)) process.loadEnvFile(envFile);
 
-const REQUIRED = ["DATABASE_URL", "SESSION_SECRET", "FEEDS_DIR", "STORAGE_DIR", "BANK_DIR", "AS_OF_DATE"];
+const { useDatasetDate } = await import("@/lib/asOfDate");
+useDatasetDate(ROOT);
+
+const REQUIRED = ["DATABASE_URL", "SESSION_SECRET", "FEEDS_DIR", "STORAGE_DIR", "BANK_DIR"];
 const missing = REQUIRED.filter((k) => !process.env[k]);
 if (missing.length) {
   console.error(`Missing required settings: ${missing.join(", ")}. Copy .env.example to .env.local and fill them in.`);
@@ -17,6 +20,20 @@ if (missing.length) {
 for (const k of ["FEEDS_DIR", "STORAGE_DIR", "BANK_DIR"]) process.env[k] = path.resolve(ROOT, process.env[k]!);
 
 // Loaded after the environment, since the database pool reads it when imported.
+// An existing database is brought up to db/schema.sql first: each migration in db/migrations, in order. Each one is written
+// to be safe to run again, so they all run on every start.
+const { pool } = await import("@/lib/db");
+const { readdirSync, readFileSync } = await import("fs");
+const migrations = path.join(ROOT, "db", "migrations");
+for (const f of readdirSync(migrations).filter((x) => x.endsWith(".sql")).sort()) {
+  try {
+    await pool.query(readFileSync(path.join(migrations, f), "utf8"));
+  } catch (e) {
+    console.error(`Database migration ${f} failed: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  }
+}
+
 const { errors } = await import("./http");
 const { session } = await import("./routes/session");
 const { organizations, organization } = await import("./routes/organizations");
@@ -25,6 +42,7 @@ const { invoices } = await import("./routes/invoices");
 const { payments } = await import("./routes/payments");
 const { audit } = await import("./routes/audit");
 const { mcp } = await import("./mcp");
+const { assistant } = await import("./routes/assistant");
 
 const app = express();
 app.use(cookieParser());
@@ -33,6 +51,7 @@ const api = express.Router();
 api.use(express.json({ limit: "5mb" }));
 api.use(session);
 api.use("/organizations", organizations);
+api.use(assistant);
 for (const r of [organization, vendors, invoices, payments, audit]) api.use("/organizations/:orgId", r);
 api.use((_req, res) => {
   res.status(404).json({ error: "No such endpoint" });
@@ -61,8 +80,8 @@ app.listen(port, () => console.log(`http://localhost:${port}`));
 const { resumeReading } = await import("@/services/intake.service");
 void resumeReading();
 
-// what the bank reports is taken in every minute, so payments settle on their own
+// what the bank reports is taken in every few seconds, so payments settle, or fail, on their own
 const { importStatements } = await import("@/services/statement.service");
 const importBank = () => importStatements().catch((e) => console.error("bank statement import failed:", e instanceof Error ? e.message : e));
 void importBank();
-setInterval(importBank, 60_000);
+setInterval(importBank, 5_000);

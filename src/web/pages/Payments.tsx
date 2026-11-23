@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { can } from "@/lib/authz";
 import { money } from "@/lib/format";
 import type { getInvoiceRecord, InvoiceRow, PaymentRow } from "@/services/read.service";
@@ -139,7 +139,7 @@ export function Payments() {
                       {p.can_release && <ApiForm submit={release(p.payment_id)} confirm={`Release ${money(p.amount, p.currency)} to ${p.vendor}?`}><button className={btn}>Release</button></ApiForm>}
                       {p.release_blocked && <span className="text-xs muted">{p.release_blocked}</span>}
                       {p.can_cancel && <div className="mt-1"><CancelPayment p={p} done={(n) => { setNotice(n); rows.reload(); ready.reload(); }} /></div>}
-                      <FailPayment p={p} onFailed={() => rows.reload()} />
+                      <FailPayment p={p} onFailed={() => { rows.reload(); ready.reload(); }} />
                     </Td>
                   </tr>
                 ))}
@@ -166,11 +166,17 @@ export function Payment() {
     return { p, inv, gl };
   }, id);
   const [notice, setNotice] = useState<string | null>(null);
+  const navigate = useNavigate();
   if (!can(user, "payment.view")) return <NotFound />;
   const release = async () => {
     await post(org(user, `/payments/${id}/release`));
     load.reload();
     return "Released.";
+  };
+  // after a failed or cancelled payment the invoice is approved again: its next payment, prepared from here
+  const prepareAnother = (invoiceId: string) => async () => {
+    const r = await post<{ id: string }>(org(user, "/payments"), { invoice_id: invoiceId });
+    navigate(`/payments/${r.id}`);
   };
 
   return (
@@ -186,6 +192,9 @@ export function Payment() {
                 {p.can_release ? <ApiForm inline submit={release} confirm={`Release ${money(p.amount, p.currency)} to ${p.vendor}?`}><button className={btn}>Release</button></ApiForm> : p.release_blocked && <span className="text-xs muted">{p.release_blocked}</span>}
                 {p.can_cancel && <CancelPayment p={p} done={(n) => { setNotice(n); load.reload(); }} />}
                 <FailPayment p={p} onFailed={() => load.reload()} />
+                {(p.status === "failed" || p.status === "cancelled") && inv.status === "approved" && can(user, "payment.prepare") && (
+                  <ApiForm inline submit={prepareAnother(inv.invoice_id)}><button className={btn}>Prepare another payment</button></ApiForm>
+                )}
               </div>}>
                 <dl className="grid grid-cols-2 gap-2 text-sm">
                   <dt className="muted">Method</dt><dd>{p.method}</dd>

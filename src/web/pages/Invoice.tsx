@@ -9,7 +9,7 @@ import type { getInvoiceRecord, getParsedInvoiceRecord, getRawItemRecord } from 
 import { HANDLING_HINTS, HANDLING_OUTCOMES, type HandlingOutcome } from "@/lib/handling";
 import type { TrailEvent } from "@/services/audit.service";
 import type { PurchaseOrderChoice } from "@/services/purchaseOrderLink.service";
-import { ApiError, call, get, patch, post, useLoad } from "../api";
+import { ApiError, call, del, get, patch, post, useLoad } from "../api";
 import { org, useUser } from "../session";
 import { ApiForm, str } from "../components/ApiForm";
 import { InvoiceEntry, type EnteredInvoice } from "./InvoiceIntake";
@@ -99,6 +99,10 @@ export function Invoice() {
         const readAgain = async () => {
           const r = await post<{ id: string }>(org(user, `/parsed-invoices/${parsed!.parsed_invoice_id}/read-again`));
           navigate(`/invoices/${r.id}`);
+        };
+        const deleteSubmission = async () => {
+          await del(org(user, `/raw-items/${raw!.raw_item_id}`));
+          navigate("/invoices", { state: { notice: `Submission ${raw!.raw_item_id} deleted.` } });
         };
         const runChecks = async () => {
           await post(org(user, `/parsed-invoices/${parsed!.parsed_invoice_id}/checks`));
@@ -238,7 +242,7 @@ export function Invoice() {
                             <div>
                               <div className="mb-1 flex gap-1"><Status value={f.severity} /><Badge>{f.category === "po" ? "purchase order" : f.category}</Badge>{f.line_no && <Badge>line {f.line_no}</Badge>}{f.status !== "open" && <Status value={f.status} />}</div>
                               <p className="text-sm">{f.message} {f.related_invoice_id && <A href={`/invoices/${f.related_invoice_id}`}>Open {f.related_invoice_id}</A>}</p>
-                              {f.resolution_note && <p className="mt-1 text-xs muted">{f.resolver}: {f.resolution_note}</p>}
+                              {f.resolution_note && <p className="mt-1 text-xs muted">{f.resolver ? `${f.resolver}: ` : ""}{f.resolution_note}</p>}
                             </div>
                           </div>
                           {f.status === "open" && f.category === "fraud" && !can(user, "flag.resolve_fraud") && (parsed?.status === "pending" || !!invoice) && (
@@ -333,6 +337,17 @@ export function Invoice() {
                   ))}
                 </Table>
               </Card>
+            )}
+
+            {/* your own submission, until it becomes an invoice: delete it, with what was read from it */}
+            {raw && raw.submitted_by === user.user_id && can(user, "raw.submit") && !invoice && parsed?.status !== "approved" && (
+              <ApiForm
+                submit={deleteSubmission}
+                confirm={`Delete your submission ${raw.raw_item_id}${parsed ? ` and ${parsed.parsed_invoice_id}, read from it` : ""}? This cannot be undone.`}
+                className="border-t border-line pt-5"
+              >
+                <button className={btnDanger}>Delete submission</button>
+              </ApiForm>
             )}
           </div>
         );

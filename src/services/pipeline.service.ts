@@ -47,6 +47,7 @@ export async function readRawItem(organizationId: string, rawItemId: string): Pr
   }
 
   return tx(async (c) => {
+    await checkInTurn(c, raw.organization_id);
     if (noInvoice) {
       await query("UPDATE raw_items SET status='no_invoice', no_invoice_reason=$2, failure_reason=NULL, extracted_at=now() WHERE raw_item_id=$1", [raw.raw_item_id, noInvoice], c);
       await writeAudit(c, { organizationId: raw.organization_id, actor, action: "raw_item.no_invoice", entityType: "raw_item", entityId: raw.raw_item_id, note: noInvoice });
@@ -69,6 +70,10 @@ export async function readRawItem(organizationId: string, rawItemId: string): Pr
     return { parsed: ids };
   });
 }
+
+// Readings come in several at a time, but each is stored and checked in turn, per organization (a lock held until the
+// transaction ends), so the duplicate and split checks always see every invoice stored before it.
+const checkInTurn = (c: Db, organizationId: string) => query("SELECT pg_advisory_xact_lock(hashtext($1))", [`checks:${organizationId}`], c);
 
 // One stored file read: the invoice in it, or why it is not one. A file that cannot be opened gives an empty invoice, flagged.
 async function readFile(raw: RawItem, f: StoredFile): Promise<Found | { notInvoice: string }> {
@@ -102,6 +107,7 @@ export async function readParsedAgain(actor: User | null, organizationId: string
     found = r;
   }
   return tx(async (c) => {
+    await checkInTurn(c, organizationId);
     await query("DELETE FROM invoice_flags WHERE parsed_invoice_id=$1", [parsedInvoiceId], c);
     const gone = await query("DELETE FROM parsed_invoices WHERE parsed_invoice_id=$1 AND status<>'approved' RETURNING 1", [parsedInvoiceId], c);
     if (!gone.length) throw new ConflictError("Already approved into the invoices.");

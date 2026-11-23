@@ -3,6 +3,7 @@ const NAMES: Record<string, string> = {
   "raw_item.poll": "Email received",
   "raw_item.upload": "PDF uploaded",
   "raw_item.form": "Form submitted",
+  "raw_item.delete": "Submission deleted",
   "raw_item.no_invoice": "No invoice found",
   "raw_item.read_failed": "Reading failed",
   "parsed_invoice.create": "Invoice read",

@@ -6,6 +6,7 @@ import {
 } from "@/services/read.service";
 import { invoiceTrail, parsedInvoiceTrail } from "@/services/audit.service";
 import { readStoredFile } from "@/services/rawIntake.service";
+import { deleteRawItem } from "@/services/itemDelete.service";
 import { attentionCounts, handleRawItem } from "@/services/rawItemHandling.service";
 import { pollAndRead, submitInvoiceForm, uploadInvoice } from "@/services/intake.service";
 import { approve, editParsedInvoice, reject, resolveFlag, runChecksAgain, saveEdits, type ReviewEdit } from "@/services/parsedInvoiceReview.service";
@@ -57,6 +58,9 @@ invoices.post("/raw-items/:id/handle", route(async ({ user, params, body }) => {
   await handleRawItem(user, params.orgId, params.id, { outcome: body.outcome, note: body.note, forwardedTo: body.forwardedTo });
   return getRawItemRecord(user, params.orgId, params.id);
 }, { gate: "parsed.review" }));
+// Deletes a submission: the raw item, its files and the parsed invoice read from it. Only whoever submitted it, and
+// not once it became an invoice.
+invoices.delete("/raw-items/:id", route(async ({ user, params }) => deleteRawItem(user, params.orgId, params.id)));
 // The stored attachment, as it arrived.
 invoices.get("/raw-items/:id/files/:name", route(async ({ res, user, params }) => {
   const raw = await getRawItemRecord(user, params.orgId, params.id);

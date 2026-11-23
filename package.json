@@ -3,9 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "tsx watch --clear-screen=false src/server/index.ts",
+    "dev": "tsx scripts/run.ts dev",
+    "server": "tsx watch --clear-screen=false src/server/index.ts",
+    "bank": "tsx scripts/bank.ts",
     "build": "vite build",
-    "start": "NODE_ENV=production tsx src/server/index.ts",
+    "start": "tsx scripts/run.ts start",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {

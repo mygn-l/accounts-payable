@@ -6,21 +6,23 @@ import { pollInbox } from "./inboxPolling.service";
 import { readRawItem } from "./pipeline.service";
 
 // How invoices come in. A form is the invoice itself and becomes a parsed invoice at once.
-// An upload or a polled email is stored, answered, then read in the background, one at a time.
+// An upload or a polled email is stored, answered, then read in the background, five at a time (the reading itself is
+// what takes long; storing and checking each one still happens in turn, see readRawItem).
 
+const READERS = 5;
 const queue: { organizationId: string; rawItemId: string }[] = [];
 const queued = new Set<string>();
-let reading = false;
+let readers = 0;
 
 function queueReading(organizationId: string, rawItemId: string) {
   if (queued.has(rawItemId)) return;
   queued.add(rawItemId);
   queue.push({ organizationId, rawItemId });
-  if (!reading) void readQueue();
+  while (readers < Math.min(READERS, queue.length)) void readQueue();
 }
 
 async function readQueue() {
-  reading = true;
+  readers++;
   while (queue.length) {
     const job = queue.shift()!;
     try {
@@ -32,7 +34,7 @@ async function readQueue() {
       queued.delete(job.rawItemId);
     }
   }
-  reading = false;
+  readers--;
 }
 
 // A raw item that could not be read keeps the reason; the next poll tries it again.

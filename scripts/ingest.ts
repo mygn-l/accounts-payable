@@ -1,4 +1,4 @@
-// Loads the Harborline dataset. setup and history write the organization's records and past invoices straight into the database,
+// Loads the dataset in DATASET_DIR (the brim_ap_dataset format). setup and history write the organization's records and past invoices straight into the database,
 // with the dataset's own ids and dates; each past invoice still goes through the app's resolution and checks, so its flags are raised.
 // The actions the dataset records (submissions, approvals, payments, bank changes) go into the audit log under their people and times.
 // inbox polls the AP inbox through the running app, the way new invoices arrive.
@@ -20,36 +20,51 @@ const { invoiceNumberCore } = await import("../src/lib/normalize");
 type RawItem = import("../src/services/rawIntake.service").RawItem;
 type InvoiceData = import("../src/lib/types").InvoiceData;
 
-const DATA = path.join(process.env.DATASET_DIR ?? "/Users/ming/Downloads/brim_ap_dataset", "data");
-const ORG = "ORG-HARBORLINE";
-const ORG_GST = "100000001RT0001";
-
+const DATA = path.resolve(import.meta.dirname, "..", process.env.DATASET_DIR ?? "brim_ap_dataset", "data");
 const csv = (name: string) => parseCsv(readFileSync(path.join(DATA, `${name}.csv`), "utf8"));
 const num = (s: string) => (s === "" ? null : Number(s));
 const yes = (s: string) => s === "yes";
 const orNull = (s: string) => (s === "" ? null : s);
 
-// The dataset's rules P01–P13 (free-text conditions) as: when [field] [operator] [value], require [required].
-// P07 (requester → their manager) and P08 (on leave → delegate) are how every approval chain works, not policies.
+// The organization is the one the dataset is about, named in its README's title ("# <name> AP dataset"); its id is ORG- and
+// the name's first word. Its own GST/HST number is printed on its invoices, not in the dataset: ORG_GST_HST_NUMBER, when set.
+const README = readFileSync(path.join(DATA, "..", "README.md"), "utf8");
+const ORG_NAME = README.match(/^#\s+(.+?)\s+AP dataset/m)?.[1]?.trim();
+if (!ORG_NAME) throw new Error("The dataset README's title should read \"# <organization> AP dataset\".");
+const ORG = `ORG-${ORG_NAME.split(/\s+/)[0].toUpperCase().replace(/[^A-Z0-9]/g, "")}`;
+const ORG_GST = process.env.ORG_GST_HST_NUMBER || null;
+
+// The dataset's rules (free-text conditions) as: when [field] [operator] [value], require [required]. The conditions are read
+// in the dataset's wording; "Requester is the approver" and "Approver is on leave" are how every approval chain works, not policies.
 type PolicyShape = { rule_type: string; field: string; operator: string; value: string | null; required: string[] };
-const POLICY_MAP: Record<string, PolicyShape> = {
-  P01: { rule_type: "approval", field: "invoice_total", operator: "<=", value: "10000", required: ["dept_manager"] },
-  P02: { rule_type: "approval", field: "invoice_total", operator: ">", value: "10000", required: ["dept_manager", "finance_manager"] },
-  P03: { rule_type: "approval", field: "invoice_total", operator: ">", value: "50000", required: ["dept_manager", "finance_manager", "controller"] },
-  P04: { rule_type: "approval", field: "invoice_total", operator: ">", value: "250000", required: ["dept_manager", "finance_manager", "controller", "cfo"] },
-  P05: { rule_type: "approval", field: "vendor_status", operator: "in", value: "pending_review,new", required: ["finance_manager"] },
-  P06: { rule_type: "approval", field: "vendor_category", operator: "is", value: "Legal", required: ["finance_manager"] },
-  P09: { rule_type: "payment_release", field: "payment_amount", operator: "<=", value: "100000", required: ["finance_manager"] },
-  P10: { rule_type: "payment_release", field: "payment_amount", operator: ">", value: "100000", required: ["controller"] },
-  P11: { rule_type: "payment_release", field: "any_payment", operator: "always", value: null, required: ["not_approver"] },
-  P12: { rule_type: "match", field: "po_over_balance", operator: "always", value: null, required: ["finance_manager"] },
-  P13: { rule_type: "match", field: "po_missing", operator: "always", value: null, required: ["hold"] },
-};
+const ROLE_WORDS: Record<string, string> = { controller_admin: "controller", "not the invoice approver": "not_approver" };
+const amount = (s: string) => s.replace(/[$,]/g, "");
+function policyShape(p: Record<string, string>): PolicyShape | "chain" | null {
+  const c = p.condition.trim();
+  const required = p.required.split(">").map((r) => r.trim()).map((r) => ROLE_WORDS[r] ?? r);
+  let m: RegExpMatchArray | null;
+  if (/^requester is the approver|^approver is on leave/i.test(c)) return "chain";
+  if ((m = c.match(/^(invoice total|payment) (up to|over) \$?([\d,.]+)/i))) {
+    const field = /^invoice/i.test(m[1]) ? "invoice_total" : "payment_amount";
+    return { rule_type: p.rule_type, field, operator: /up to/i.test(m[2]) ? "<=" : ">", value: amount(m[3]), required };
+  }
+  if ((m = c.match(/^vendor status is (\w+)( or the vendor is new)?/i)))
+    return { rule_type: p.rule_type, field: "vendor_status", operator: "in", value: [m[1], ...(m[2] ? ["new"] : [])].join(","), required };
+  if ((m = c.match(/^vendor category is (.+)$/i))) return { rule_type: p.rule_type, field: "vendor_category", operator: "is", value: m[1].trim(), required };
+  if (/^always$/i.test(c) && p.rule_type === "payment_release") return { rule_type: p.rule_type, field: "any_payment", operator: "always", value: null, required };
+  // matching a purchase order: over its remaining balance goes to the role in the notes; a missing one holds the invoice
+  if (/references a po/i.test(c)) {
+    const role = ["finance_manager", "controller", "cfo"].find((r) => p.notes.toLowerCase().includes(r.replace("_", " "))) ?? "finance_manager";
+    return { rule_type: p.rule_type, field: "po_over_balance", operator: "always", value: null, required: [role] };
+  }
+  if (/requires a po/i.test(c)) return { rule_type: p.rule_type, field: "po_missing", operator: "always", value: null, required: ["hold"] };
+  return null;
+}
 
 // The organization, its people, accounts, policies, vendors, bank changes, contracts and purchase orders, as the dataset has them.
 async function setup() {
   await tx(async (c) => {
-    await query("INSERT INTO organizations (organization_id, legal_name, gst_hst_number, base_currency) VALUES ($1,$2,$3,'CAD')", [ORG, "Harborline Logistics Inc.", ORG_GST], c);
+    await query("INSERT INTO organizations (organization_id, legal_name, gst_hst_number, base_currency) VALUES ($1,$2,$3,'CAD')", [ORG, ORG_NAME, ORG_GST], c);
     // a department's manager is checked at the end of the transaction, once the users exist
     for (const d of csv("departments")) {
       await query("INSERT INTO departments (department_id, organization_id, name, cost_centre, manager_user_id) VALUES ($1,$2,$3,$4,$5)", [d.department_id, ORG, d.name, orNull(d.cost_centre), orNull(d.manager_user_id)], c);
@@ -72,8 +87,12 @@ async function setup() {
       await query("INSERT INTO gl_accounts (account_number, organization_id, name, account_type) VALUES ($1,$2,$3,$4)", [g.account_number, ORG, g.name, g.account_type], c);
     }
     for (const p of csv("approval_policies")) {
-      const shape = POLICY_MAP[p.rule_id];
-      if (!shape) continue;
+      const shape = policyShape(p);
+      if (shape === "chain") continue;
+      if (!shape) {
+        console.warn(`Approval rule ${p.rule_id} was not loaded: its condition "${p.condition}" is not in a form the loader reads.`);
+        continue;
+      }
       await query(
         "INSERT INTO approval_policies (rule_id, organization_id, rule_type, field, operator, value, required, is_active) VALUES ($1,$2,$3,$4,$5,$6,$7,true)",
         [p.rule_id, ORG, shape.rule_type, shape.field, shape.operator, shape.value, shape.required],
@@ -108,7 +127,7 @@ async function setup() {
       await query(
         `INSERT INTO contracts (contract_id, vendor_id, description, monthly_fee, currency, hourly_rate_cap, fuel_surcharge_cap_pct, not_to_exceed_monthly,
            start_date, end_date, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
         [k.contract_id, k.vendor_id, orNull(k.description), num(k.monthly_fee), k.currency, num(k.hourly_rate_cap), num(k.fuel_surcharge_cap_pct),
           num(k.not_to_exceed_monthly), orNull(k.start_date), orNull(k.end_date), k.status],
         c,
@@ -140,7 +159,10 @@ async function audit(c: Parameters<typeof query>[2], e: Entry) {
   );
 }
 
-const TAX_LABEL: Record<string, string> = { HST13: "HST (13%)", GST5: "GST (5%)", QST9975: "QST (9.975%)", PST7_BC: "PST (7%)" };
+// Each tax code as printed on an invoice: its tax's name (the code's leading letters) and rate, as HST13 → "HST (13%)".
+const TAX_CODES = csv("tax_codes").filter((t) => Number(t.rate) > 0);
+const TAX_LABEL = Object.fromEntries(TAX_CODES.map((t) => [t.code, `${t.code.match(/^[A-Z]+/)![0]} (${+(Number(t.rate) * 100).toFixed(3)}%)`]));
+const FEDERAL = new Set(TAX_CODES.filter((t) => /^(GST|HST)/.test(t.code)).map((t) => t.code));
 
 // The past invoices, oldest first. Each is the requester's form received on its received date, resolved and checked by the app,
 // then an invoice with the dataset's status, approvals and payments.
@@ -154,13 +176,13 @@ async function history() {
   for (const inv of invoices) {
     const v = vendors.get(inv.vendor_id)!;
     const mine = lines.filter((l) => l.invoice_id === inv.invoice_id);
-    const gstCode = mine.find((l) => l.gst_hst_code === "HST13" || l.gst_hst_code === "GST5")?.gst_hst_code;
+    const gstCode = mine.find((l) => FEDERAL.has(l.gst_hst_code))?.gst_hst_code;
     const pstCode = mine.find((l) => l.pst_qst_code)?.pst_qst_code;
     const form = {
       document_type: Number(inv.total) < 0 ? "credit_note" : "invoice",
       vendor_name: v.legal_name, vendor_gst_hst_number: orNull(v.gst_hst_number), vendor_qst_number: orNull(v.qst_number),
       vendor_invoice_number: inv.vendor_invoice_number, invoice_date: inv.invoice_date, due_date: inv.due_date, received_date: inv.received_date,
-      bill_to_name: "Harborline Logistics Inc.", bill_to_tax_number: ORG_GST, currency: inv.currency,
+      bill_to_name: ORG_NAME, bill_to_tax_number: ORG_GST, currency: inv.currency,
       subtotal: Number(inv.subtotal), total: Number(inv.total),
       taxes: [
         ...(Number(inv.gst_hst_amount) && gstCode ? [{ label: TAX_LABEL[gstCode], rate: null, amount: Number(inv.gst_hst_amount) }] : []),
@@ -191,7 +213,13 @@ async function history() {
       await query("INSERT INTO parsed_invoices (parsed_invoice_id, organization_id, raw_item_id, invoice_json) VALUES ($1,$2,$3,$4)", [parsedId, ORG, rawId, JSON.stringify(data)], c);
       await audit(c, { at: inv.received_date, by: null, action: "parsed_invoice.create", entityType: "parsed_invoice", entityId: parsedId });
       const d = await resolveAndCheck(c, parsedId, raw, data);
-      await query("UPDATE invoice_flags SET created_at=$2 WHERE parsed_invoice_id=$1", [parsedId, inv.received_date], c);
+      // the organization approved these before Brim AP: the flags stay on record, closed, since nobody reviewed them here; an open
+      // one would make settled history look unresolved and hold its payment.
+      await query(
+        "UPDATE invoice_flags SET created_at=$2, status='resolved', resolved_at=$2, resolution_note='Approved before Brim AP; never reviewed here.' WHERE parsed_invoice_id=$1",
+        [parsedId, inv.received_date],
+        c,
+      );
 
       const dup = await one<{ related_invoice_id: string }>(
         "SELECT related_invoice_id FROM invoice_flags WHERE parsed_invoice_id=$1 AND category='duplicate' AND related_invoice_id IS NOT NULL LIMIT 1",
@@ -261,12 +289,15 @@ async function history() {
   console.log(`history done: ${n}`);
 }
 
-// New invoices arrive the way they do in the app: Jordan, an AP clerk, polls the inbox; the running server reads what came in.
+// New invoices arrive the way they do in the app: an AP clerk (the dataset's first active one) polls the inbox; the running
+// server reads what came in.
 async function inbox() {
   const base = process.env.BASE_URL ?? "http://localhost:3000";
+  const clerk = csv("users").find((u) => u.role === "ap_clerk" && u.status === "active");
+  if (!clerk) throw new Error("The dataset has no active AP clerk to poll the inbox.");
   const session = await fetch(`${base}/api/session`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ email: "jordan.okafor@harborline-logistics.example", password: PASSWORD, portal: "organization" }),
+    body: JSON.stringify({ email: clerk.email, password: PASSWORD, portal: "organization" }),
   });
   if (!session.ok) throw new Error(`Sign-in failed: ${(await session.json()).error}`);
   const cookie = session.headers.get("set-cookie")!.split(";")[0];

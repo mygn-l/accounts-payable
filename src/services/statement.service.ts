@@ -7,17 +7,20 @@ import { writeAudit } from "@/lib/audit";
 // A line as the bank or the card feed reports it, with what it is.
 export type StatementLine = {
   line_id: string; source: "bank" | "card"; posted_date: string; description: string; amount: number;
-  kind: "eft" | "cheque" | "card" | "other"; reference: string | null;
+  kind: "eft" | "cheque" | "card" | "return" | "other"; reference: string | null;
 };
 
-// A bank statement row: an EFT payment ends with the last 6 digits of the payment's reference; a cheque clears by its number.
+// A bank statement row: an EFT payment ends with the last 6 digits of the payment's reference; a cheque clears by its number;
+// a payment the bank sent back reads "PAYMENT RETURNED <EFT|CHEQUE|CARD> <reference> <reason>", the money credited back.
 export function bankLine(r: Record<string, string>): StatementLine {
   const eft = r.description.match(/^EFT PMT .* (\d{6})$/);
   const cheque = r.description.match(/^CHEQUE (\d+) CLEARED$/);
+  const ret = r.description.match(/^PAYMENT RETURNED (EFT|CHEQUE|CARD) (\S+) /);
   return {
     line_id: r.bank_txn_id, source: "bank", posted_date: r.posted_date, description: r.description.replace(/\s+/g, " ").trim(),
     amount: Number(r.debit || 0) - Number(r.credit || 0),
-    kind: eft ? "eft" : cheque ? "cheque" : "other", reference: eft?.[1] ?? cheque?.[1] ?? null,
+    kind: eft ? "eft" : cheque ? "cheque" : ret ? "return" : "other",
+    reference: eft?.[1] ?? cheque?.[1] ?? (ret ? `${ret[1]} ${ret[2]}` : null),
   };
 }
 
@@ -50,7 +53,7 @@ function readBankFiles(): StatementLine[] {
   return [...csvs("statements").map(bankLine), ...csvs("card").map(cardLine).filter((l): l is StatementLine => !!l)];
 }
 
-// Runs on its own, every minute: each organization with payments at the bank takes in what the bank reported since the last run.
+// Runs on its own, every few seconds: each organization with payments at the bank takes in what the bank reported since the last run.
 export async function importStatements() {
   const orgs = await query<{ organization_id: string }>(
     "SELECT DISTINCT organization_id FROM payments WHERE status IN ('released','outstanding') ORDER BY organization_id",
@@ -66,13 +69,33 @@ async function importStatement(organizationId: string): Promise<{ lines: number;
     let added = 0;
     for (const l of lines) if (await insertLine(c, organizationId, l)) added++;
 
-    const open = await query<{ line_id: string; posted_date: string; amount: number; kind: string; reference: string }>(
-      "SELECT line_id, posted_date::text, amount::float, kind, reference FROM statement_lines WHERE organization_id=$1 AND payment_id IS NULL AND kind<>'other' ORDER BY posted_date, line_id",
+    const open = await query<{ line_id: string; posted_date: string; description: string; amount: number; kind: string; reference: string }>(
+      "SELECT line_id, posted_date::text, description, amount::float, kind, reference FROM statement_lines WHERE organization_id=$1 AND payment_id IS NULL AND kind<>'other' ORDER BY posted_date, line_id",
       [organizationId],
       c,
     );
     let settled = 0;
     for (const l of open) {
+      if (l.kind === "return") {
+        // a payment sent back: it failed, with the bank's reason, and its invoice can be paid again
+        const [method, ref] = l.reference.split(" ");
+        const pay = await one<{ payment_id: string; invoice_id: string; vendor_id: string }>(
+          `SELECT payment_id, invoice_id, vendor_id FROM payments WHERE organization_id=$1 AND method=$2 AND status IN ('released','outstanding') AND amount_cad=$4
+             AND CASE $2 WHEN 'EFT' THEN right(bank_reference, 6)=$3 WHEN 'CHEQUE' THEN cheque_number::text=$3 ELSE 'VC-' || invoice_id=$3 END`,
+          [organizationId, method, ref, Math.abs(l.amount)],
+          c,
+        );
+        if (!pay) continue;
+        const reason = `Returned by the bank: ${l.description.replace(/^PAYMENT RETURNED \S+ \S+ /, "")}`;
+        await query("UPDATE payments SET status='failed', failure_reason=$2 WHERE payment_id=$1", [pay.payment_id, reason], c);
+        await query("UPDATE statement_lines SET payment_id=$2 WHERE line_id=$1", [l.line_id, pay.payment_id], c);
+        await query("UPDATE invoices SET status='approved' WHERE invoice_id=$1", [pay.invoice_id], c);
+        await writeAudit(c, {
+          organizationId, actor: null, action: "payment.failed", entityType: "payment", entityId: pay.payment_id,
+          invoiceId: pay.invoice_id, paymentId: pay.payment_id, vendorId: pay.vendor_id, note: reason,
+        });
+        continue;
+      }
       const pay = await one<{ payment_id: string; invoice_id: string; vendor_id: string }>(
         l.kind === "eft"
           ? "SELECT payment_id, invoice_id, vendor_id FROM payments WHERE organization_id=$1 AND method='EFT' AND status='released' AND right(bank_reference, 6)=$2 AND amount_cad=$3"
